@@ -61,7 +61,7 @@ def send_email_with_video(video_path, user_name, timestamp):
 
     message = MIMEMultipart()
     message["From"] = SENDER_EMAIL
-    message["To"] = RECEIVER_EMAIL
+    message["To"] = ','.join(RECEIVER_EMAIL)
     message["Subject"] = subject
     message.attach(MIMEText(body, "plain"))
 
