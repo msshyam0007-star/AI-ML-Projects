@@ -2,18 +2,19 @@ import cv2
 import easyocr
 import RPi.GPIO as GPIO
 import time
+import signal
 import sys
 import csv
+import subprocess
 import os
 from datetime import datetime
 from mfrc522 import SimpleMFRC522
 import smtplib
-from email.mime.text import MIMEText
+from email.mime_text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 from RPLCD.i2c import CharLCD   # LCD library
-import threading
 
 # ---------------- Email config ----------------
 SENDER_EMAIL = "hemanthkumar04373@gmail.com"
@@ -25,25 +26,22 @@ LOG_FILE = "dispense_log.csv"
 # ---------------- LCD setup ----------------
 lcd = CharLCD('PCF8574', 0x27)
 
-def lcd_display(message):
+def lcd_display(message, hold=2):
+    """Show message temporarily, then revert to date/time."""
     lcd.clear()
-    lcd.write_string(message[:32])  # truncate to avoid overflow
+    lcd.write_string(message[:32])
     print(f"LCD: {message}")
+    time.sleep(hold)
+    lcd_show_datetime()
+
+def lcd_show_datetime():
+    """Always show current date/time."""
+    lcd.clear()
+    lcd.write_string(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 def lcd_clear():
     lcd.clear()
     print("LCD cleared")
-
-# ---------------- Time & Date Display ----------------
-def show_time_date():
-    while True:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        lcd_display(now)
-        time.sleep(1)
-
-# Run time/date display in background thread
-time_thread = threading.Thread(target=show_time_date, daemon=True)
-time_thread.start()
 
 # ---------------- Logging ----------------
 def log_dispense_event(rfid_tag, user_name, timestamp):
@@ -137,20 +135,18 @@ GPIO.setup(GPIO_TRIGGER, GPIO.OUT)
 GPIO.setup(GPIO_ECHO, GPIO.IN)
 
 def distance():
-    # Send trigger pulse
     GPIO.output(GPIO_TRIGGER, True)
-    time.sleep(0.00002)  # 20 µs
+    time.sleep(0.00001)
     GPIO.output(GPIO_TRIGGER, False)
 
-    # Wait for echo start
     start_time = time.time()
-    timeout = start_time + 0.2
+    stop_time = time.time()
+
+    timeout = time.time() + 0.05
     while GPIO.input(GPIO_ECHO) == 0 and time.time() < timeout:
         start_time = time.time()
 
-    # Wait for echo end
-    stop_time = time.time()
-    timeout = stop_time + 0.2
+    timeout = time.time() + 0.05
     while GPIO.input(GPIO_ECHO) == 1 and time.time() < timeout:
         stop_time = time.time()
 
@@ -158,12 +154,80 @@ def distance():
     dist = (elapsed * 34300) / 2
     return dist
 
-def average_distance(samples=3):
-    readings = []
-    for _ in range(samples):
-        readings.append(distance())
+def move_until_object(threshold=5.0):
+    start = time.time()
+    move_forward()
+    while True:
+        d = distance()
+        print(f"Distance: {d:.2f} cm")
+        if d <= threshold:
+            stop_motors()
+            forward_time = time.time() - start
+            print("Object detected within threshold.")
+            return forward_time
         time.sleep(0.05)
-    return sum(readings) / len(readings)
+
+# ---------------- Servo setup ----------------
+SERVO_INDEX_PIN = 14
+SERVO_DOOR_PIN = 26
+GPIO.setup(SERVO_INDEX_PIN, GPIO.OUT)
+GPIO.setup(SERVO_DOOR_PIN, GPIO.OUT)
+
+servo_index = GPIO.PWM(SERVO_INDEX_PIN, 50)
+servo_door = GPIO.PWM(SERVO_DOOR_PIN, 50)
+servo_index.start(0)
+servo_door.start(0)
+
+DOOR_OPEN = 60
+DOOR_CLOSE = 180
+
+def angle_to_duty(angle):
+    return 2 + (angle / 18)
+
+def set_angle(angle, hold=0.5):
+    duty = 2 + (angle / 18)
+    GPIO.output(SERVO_DOOR_PIN, True)
+    servo_door.ChangeDutyCycle(duty)
+    time.sleep(hold)
+    GPIO.output(SERVO_DOOR_PIN, False)
+    servo_door.ChangeDutyCycle(0)
+
+def index_servo_to_angle(angle, hold=1.0):
+    lcd_display(f"Index servo {angle} deg")
+    duty = angle_to_duty(angle)
+    servo_index.ChangeDutyCycle(duty)
+    time.sleep(hold)
+    servo_index.ChangeDutyCycle(0)
+
+def door_open():
+    lcd_display("Door opened")
+    set_angle(DOOR_OPEN, hold=1.0)
+    print("Door opened")
+
+def door_close():
+    lcd_display("Thank You")
+    set_angle(DOOR_CLOSE, hold=1.0)
+    print("Door closed")
+
+# ---------------- RFID dictionary ----------------
+rfid = {
+    "353610563795": {"name": "Hemanth", "part": 2}
+}
+
+# ---------------- Bluetooth speech ----------------
+def speak(message):
+    print(f"TTS: {message}")
+    lcd_display(message)
+    try:
+        tmp_wav = "/tmp/tts.wav"
+        subprocess.run(["pico2wave", "-w", tmp_wav, message], check=True)
+        subprocess.run(["paplay", tmp_wav], check=True)
+    except Exception as e:
+        print(f"pico2wave/paplay failed ({e}), trying espeak...")
+        try:
+            subprocess.run(["espeak", message], check=True)
+        except Exception as e2:
+            print(f"espeak failed: {e2}")
 
 # ---------------- RFID setup ----------------
 reader_rfid = SimpleMFRC522()
@@ -176,53 +240,140 @@ def read_rfid():
     print(f"Card ID: {id}, Data: {text}, Normalized key: '{rfid_key}'")
     return rfid_key
 
-# ---------------- OCR setup ----------------
-reader = easyocr.Reader(['en'])
+# ---------------- Camera setup ----------------
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+# ---------------- Time-based Index Servo ----------------
+PART_ANGLE = {1: 0, 2: 90, 3: 180}
+
+def move_servo_by_time():
+    now = datetime.now()
+    hour = now.hour
+
+    if 6 <= hour < 12:
+        part = 1   # Morning
+        lcd_display("Morning: Part 1")
+        angle = PART_ANGLE[part]
+        index_servo_to_angle(angle)
+
+    elif 12 <= hour < 18:
+        part = 2   # Afternoon
+        lcd_display("Afternoon: Part 2")
+        angle = PART_ANGLE[part]
+        index_servo_to_angle(angle)
+
+    else:
+        part = 3   # Night
+        lcd_display("Night: Part 3")
+        angle = PART_ANGLE[part]
+        index_servo_to_angle(angle)
+
+# ---------------- Dispense logic ----------------
+def dispense_tablet(tag, forward_time):
+    now = datetime.now()
+    if tag in rfid:
+        name = rfid[tag]['name']
+        speak(f"Hello {name}, please take your tablets")
+
+        # Time-based index selection
+        move_servo_by_time()
+
+        # Open door to dispense
+        door_open()
+
+        # Record video
+        video_filename = f"dispense_{now.strftime('%Y%m%d_%H%M%S')}.avi"
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        out = cv2.VideoWriter(video_filename, fourcc, 20.0, (640, 480))
+
+        start_time = time.time()
+        while time.time() - start_time < 10:
+            ret, frame = cap.read()
+            if ret:
+                out.write(frame)
+            else:
+                time.sleep(0.05)
+        out.release()
+        print(f"Video saved as {video_filename}")
+
+        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+        send_email_with_video(video_filename, name, timestamp)
+        log_dispense_event(tag, name, timestamp)
+
+        time.sleep(3)
+        door_close()
+
+        # Reset index servo to 0° after door closes
+        lcd_display("Reset index to 0°")
+        index_servo_to_angle(0)
+
+        print("Dispense complete.")
+
+        # Return to original position
+        move_backward()
+        time.sleep(forward_time)
+        stop_motors()
+        lcd_clear()
+        lcd_show_datetime()
+        print("Process complete.")
+
+    else:
+        available = ", ".join(rfid.keys())
+        speak("Invalid user")
+        print(f"Invalid user. Read tag='{tag}'. Known keys=[{available}]")
+
+        move_backward()
+        time.sleep(forward_time)
+        stop_motors()
+        lcd_clear()
+        lcd_show_datetime()
+        print("Returned due to invalid user.")
+
+# ---------------- Safe exit handler ----------------
+def safe_exit(sig, frame):
+    print("Force exit detected, stopping motors...")
+    try:
+        stop_motors()
+    except Exception:
+        pass
+    GPIO.output(motor1_en, GPIO.LOW)
+    GPIO.output(motor2_en, GPIO.LOW)
+    try:
+        cap.release()
+    except Exception:
+        pass
+    try:
+        servo_index.stop()
+        servo_door.stop()
+    except Exception:
+        pass
+    lcd_clear()
+    GPIO.cleanup()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, safe_exit)
+signal.signal(signal.SIGTERM, safe_exit)
 
 # ---------------- Main flow ----------------
 try:
     while True:
-        # Wait 2 minutes before each forward movement
-        time.sleep(120)
+        lcd_show_datetime()
 
-        move_forward()
-        time.sleep(2)
+        # Move forward every 3 minutes
+        forward_time = move_until_object(threshold=13.0)
 
-        # Check for object
-        d = average_distance()
-        print(f"Measured distance: {d:.2f} cm")
-        if d < 10:
-            stop_motors()
-            lcd_display("Object detected")
+        # Read RFID
+        tag = read_rfid()
 
-            # Run OCR
-            ret, frame = cap.read()
-            if ret:
-                results = reader.readtext(frame)
-                for (_, text, prob) in results:
-                    digits = ''.join([c for c in text if c.isdigit()])
-                    if digits == "1":
-                        tag = read_rfid()
-                        lcd_display("Process done")
-                        time.sleep(2)
-                        lcd_clear()
-                        move_backward()
-                        time.sleep(2)
-                        stop_motors()
-                        print("Cycle complete, waiting 2 minutes...")
+        # Run full dispense logic
+        dispense_tablet(tag, forward_time)
 
-except KeyboardInterrupt:
-    print("Program interrupted by user.")
+        # Wait 3 minutes before next cycle
+        time.sleep(180)
 
 except Exception as e:
     print(f"Error occurred: {e}")
 
 finally:
-    cap.release()
-    stop_motors()
-    lcd_clear()
-    GPIO.cleanup()
-    print("Clean exit: Motors off, LCD cleared, GPIO released.")
+    safe_exit(None, None)
